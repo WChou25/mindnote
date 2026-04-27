@@ -1,7 +1,7 @@
-import { getSupabaseClient } from "./client";
+import { getSupabaseServiceClient } from "./client";
 import type { Note, Relationship, HintFeedback } from "@/core/types";
 
-const supabase = () => getSupabaseClient();
+const supabase = () => getSupabaseServiceClient();
 
 // ──────────────────────────────────────────────
 // Notes

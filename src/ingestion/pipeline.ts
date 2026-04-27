@@ -2,7 +2,7 @@ import { v4 as uuid } from "uuid";
 import type { Note, IngestResponse } from "@/core/types";
 import { DefaultNormalizer } from "./normalize";
 import { HeuristicExtractor } from "./extract";
-import { PlaceholderEmbeddingGenerator } from "./embed";
+import { generateEmbedding } from "./embed";
 import { HeuristicRelationshipDetector } from "./relationships";
 import { DefaultImportanceScorer } from "./importance";
 import { getActiveNotes, insertNote, insertRelationships } from "@/db/queries";
@@ -39,9 +39,12 @@ export async function ingestNote(
   pipelineTrace.extraction = extraction.trace;
 
   // Stage 2: Generate embedding
-  const embedder = new PlaceholderEmbeddingGenerator();
-  const embedding = await embedder.generate(normalized.clean);
-  pipelineTrace.embedding = { dimensions: embedding.length, method: "placeholder" };
+  const { embedding, fallback: embeddingFallback } = await generateEmbedding(normalized.clean);
+  pipelineTrace.embedding = {
+    dimensions: embedding.length,
+    method: embeddingFallback ? "placeholder_fallback" : "openai",
+    fallback: embeddingFallback,
+  };
 
   // Stage 3: Retrieve related active notes
   const activeNotes = await getActiveNotes(userId, 50);
@@ -59,13 +62,19 @@ export async function ingestNote(
 
   // Stage 6: Store
   const now = new Date().toISOString();
+
+  // Merge embedding fallback flag into metadata JSONB so it's queryable
+  const storedMetadata = embeddingFallback
+    ? { ...extraction.metadata, embedding_fallback: true }
+    : extraction.metadata;
+
   const note: Omit<Note, "last_accessed_at"> = {
     id: noteId,
     user_id: userId,
     content: normalized.raw,
     clean_content: normalized.clean,
     embedding,
-    metadata: extraction.metadata,
+    metadata: storedMetadata as typeof extraction.metadata,
     relationships: detection.relationships,
     importance_features: scoring.features,
     created_at: now,

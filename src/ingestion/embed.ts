@@ -1,22 +1,59 @@
+import OpenAI from "openai";
 import type { EmbeddingGenerator } from "@/core/types";
-import { EMBEDDING_DIMENSIONS } from "@/core/constants";
+import { EMBEDDING_DIMENSIONS, EMBEDDING_MODEL } from "@/core/constants";
+import { log } from "@/observability/logger";
 
-/**
- * Placeholder embedding generator.
- * Swap this out for OpenAI, Cohere, local model, etc.
- *
- * For now generates a deterministic pseudo-embedding from the text
- * so the rest of the pipeline can run end-to-end without an API key.
- */
+// ──────────────────────────────────────────────
+// OpenAI embedding generator (primary)
+// ──────────────────────────────────────────────
+
+export class OpenAIEmbeddingGenerator implements EmbeddingGenerator {
+  private openai: OpenAI;
+  private model: string;
+
+  constructor(model: string = EMBEDDING_MODEL) {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      throw new Error("Missing OPENAI_API_KEY environment variable");
+    }
+    this.openai = new OpenAI({ apiKey });
+    this.model = model;
+  }
+
+  async generate(text: string): Promise<number[]> {
+    const input = text.trim();
+    if (!input) {
+      throw new Error("Cannot embed empty text");
+    }
+
+    const response = await this.openai.embeddings.create({
+      model: this.model,
+      input,
+    });
+
+    const embedding = response.data[0]?.embedding;
+
+    if (!embedding || embedding.length !== EMBEDDING_DIMENSIONS) {
+      throw new Error(
+        `Invalid embedding returned. Expected ${EMBEDDING_DIMENSIONS} dimensions, got ${embedding?.length ?? 0}`
+      );
+    }
+
+    return embedding;
+  }
+}
+
+// ──────────────────────────────────────────────
+// Placeholder generator — only used when ALLOW_EMBEDDING_FALLBACK=true
+// ──────────────────────────────────────────────
+
 export class PlaceholderEmbeddingGenerator implements EmbeddingGenerator {
   async generate(text: string): Promise<number[]> {
-    // Simple hash-based pseudo-embedding for development
     const embedding = new Array(EMBEDDING_DIMENSIONS).fill(0);
     for (let i = 0; i < text.length; i++) {
       const idx = i % EMBEDDING_DIMENSIONS;
       embedding[idx] += text.charCodeAt(i) / 1000;
     }
-    // Normalize
     const magnitude = Math.sqrt(embedding.reduce((sum, v) => sum + v * v, 0));
     if (magnitude > 0) {
       for (let i = 0; i < embedding.length; i++) {
@@ -27,35 +64,43 @@ export class PlaceholderEmbeddingGenerator implements EmbeddingGenerator {
   }
 }
 
+// ──────────────────────────────────────────────
+// Factory: returns the right generator based on env
+// ──────────────────────────────────────────────
+
+export interface EmbedResult {
+  embedding: number[];
+  fallback: boolean;
+}
+
 /**
- * OpenAI-compatible embedding generator.
- * Requires OPENAI_API_KEY environment variable.
+ * Generates an embedding for the given text.
+ *
+ * - Uses OpenAI by default.
+ * - If ALLOW_EMBEDDING_FALLBACK=true and OpenAI fails, falls back to the
+ *   placeholder generator and sets fallback=true in the result so the caller
+ *   can mark the note accordingly.
+ * - If ALLOW_EMBEDDING_FALLBACK is not set or false, any OpenAI failure throws.
  */
-export class OpenAIEmbeddingGenerator implements EmbeddingGenerator {
-  private model: string;
+export async function generateEmbedding(text: string): Promise<EmbedResult> {
+  const allowFallback = process.env.ALLOW_EMBEDDING_FALLBACK === "true";
 
-  constructor(model: string = "text-embedding-3-small") {
-    this.model = model;
-  }
-
-  async generate(text: string): Promise<number[]> {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) throw new Error("OPENAI_API_KEY not set");
-
-    const response = await fetch("https://api.openai.com/v1/embeddings", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({ input: text, model: this.model }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`OpenAI embedding failed: ${response.status} ${await response.text()}`);
+  try {
+    const embedder = new OpenAIEmbeddingGenerator();
+    const embedding = await embedder.generate(text);
+    return { embedding, fallback: false };
+  } catch (err) {
+    if (!allowFallback) {
+      throw err;
     }
 
-    const data = await response.json();
-    return data.data[0].embedding;
+    log("embedding.fallback", {
+      reason: String(err),
+      text_length: text.length,
+    }, "warn");
+
+    const fallbackEmbedder = new PlaceholderEmbeddingGenerator();
+    const embedding = await fallbackEmbedder.generate(text);
+    return { embedding, fallback: true };
   }
 }
